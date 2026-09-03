@@ -638,6 +638,22 @@
 
 <script>
 (function(){
+  // ---------- real, permanent storage (this actually persists on a live site) ----------
+  const storage = {
+    async get(key){
+      const v = localStorage.getItem(key);
+      return v === null ? null : { key, value: v };
+    },
+    async set(key, value){
+      localStorage.setItem(key, value);
+      return { key, value };
+    },
+    async delete(key){
+      localStorage.removeItem(key);
+      return { key, deleted: true };
+    }
+  };
+
   const STORAGE_KEY_PREFIX = 'dayflow-tasks:';
   const todayStr = () => {
     const d = new Date();
@@ -702,12 +718,12 @@
   async function saveName(name){
     userName = name.trim();
     applyGreeting();
-    try{ await window.storage.set('dayflow-name', userName, false); }catch(e){}
+    try{ await storage.set('dayflow-name', userName); }catch(e){}
   }
 
   async function loadName(){
     try{
-      const res = await window.storage.get('dayflow-name', false);
+      const res = await storage.get('dayflow-name');
       if(res && res.value){
         userName = res.value;
         applyGreeting();
@@ -748,7 +764,7 @@
     taskInput.placeholder = MODES[mode].placeholder;
     timetableBox.style.display = (mode === 'student') ? 'block' : 'none';
     contentCalBox.style.display = (mode === 'creator') ? 'block' : 'none';
-    if(save !== false) window.storage.set('dayflow-mode', mode, false).catch(()=>{});
+    if(save !== false) storage.set('dayflow-mode', mode).catch(()=>{});
   }
 
   modeRow.querySelectorAll('.mode-pill').forEach(p => {
@@ -757,7 +773,7 @@
 
   async function loadMode(){
     try{
-      const res = await window.storage.get('dayflow-mode', false);
+      const res = await storage.get('dayflow-mode');
       if(res && res.value && MODES[res.value]) { setMode(res.value, false); return; }
     }catch(e){}
     setMode('personal', false);
@@ -852,7 +868,7 @@
   initSpeech();
   async function loadTasks(){
     try{
-      const res = await window.storage.get(storageKey, false);
+      const res = await storage.get(storageKey);
       if(res && res.value){
         const parsed = JSON.parse(res.value);
         tasks = parsed.map(t => ({...t, time: new Date(t.time)}));
@@ -862,7 +878,7 @@
   }
   async function saveTasks(){
     try{
-      await window.storage.set(storageKey, JSON.stringify(tasks), false);
+      await storage.set(storageKey, JSON.stringify(tasks));
     }catch(e){ console.error('Could not save tasks', e); }
   }
 
@@ -980,8 +996,10 @@
       if(ampm === 'am' && hour === 12) hour = 0;
       if(!ampm && hour < 8) hour += 12;
 
-      let subject = line.replace(dayMatch[0], '').replace(timeMatch[0], '');
-      subject = subject.replace(/^[\s,:-]+|[\s,:-]+$/g, '').trim();
+      let subject = line.replace(dayMatch[0], '');
+      subject = subject.replace(/\b\d{1,2}(:\d{2})?\s*(am|pm)?\s*(-|–|to)\s*\d{1,2}(:\d{2})?\s*(am|pm)?\b/gi, '');
+      subject = subject.replace(/\b\d{1,2}(:\d{2})?\s*(am|pm)\b/gi, '');
+      subject = subject.replace(/^[\s,:\-–]+|[\s,:\-–]+$/g, '').trim();
       if(!subject) subject = 'Class';
       subject = subject.charAt(0).toUpperCase() + subject.slice(1);
 
@@ -1068,8 +1086,9 @@
       let label = line;
       if(dayMatch) label = label.replace(dayMatch[0], '');
       if(dateMatch) label = label.replace(dateMatch[0], '');
-      if(timeMatch) label = label.replace(timeMatch[0], '');
-      label = label.replace(/^[\s,:-]+|[\s,:-]+$/g, '').trim();
+      label = label.replace(/\b\d{1,2}(:\d{2})?\s*(am|pm)?\s*(-|–|to)\s*\d{1,2}(:\d{2})?\s*(am|pm)?\b/gi, ''); // time ranges like "3:07 AM - 4:00 AM"
+      label = label.replace(/\b\d{1,2}(:\d{2})?\s*(am|pm)\b/gi, ''); // any remaining single times
+      label = label.replace(/^[\s,:\-–]+|[\s,:\-–]+$/g, '').trim();
       if(!label) label = 'Content task';
       label = label.charAt(0).toUpperCase() + label.slice(1);
 
@@ -1259,9 +1278,13 @@
 
   // ---------- OneSignal (background push, works even when app is closed) ----------
   let oneSignalSubscriptionId = null;
+  let oneSignalRef = null;
+  let resolveOneSignalReady;
+  const oneSignalReady = new Promise((res) => { resolveOneSignalReady = res; });
   window.OneSignalDeferred = window.OneSignalDeferred || [];
 
   OneSignalDeferred.push(async function(OneSignal){
+    oneSignalRef = OneSignal;
     await OneSignal.init({
       appId: 'c71df04d-deb1-45fa-bf71-99c642847216',
       serviceWorkerPath: 'onesignal/OneSignalSDKWorker.js',
@@ -1272,16 +1295,17 @@
       const id = OneSignal.User.PushSubscription.id;
       if(id){
         oneSignalSubscriptionId = id;
-        window.storage.set('dayflow-onesignal-id', id, false).catch(()=>{});
+        storage.set('dayflow-onesignal-id', id).catch(()=>{});
       }
     }
     captureSubscriptionId();
     OneSignal.User.PushSubscription.addEventListener('change', captureSubscriptionId);
+    resolveOneSignalReady();
   });
 
   async function loadStoredSubscriptionId(){
     try{
-      const res = await window.storage.get('dayflow-onesignal-id', false);
+      const res = await storage.get('dayflow-onesignal-id');
       if(res && res.value) oneSignalSubscriptionId = res.value;
     }catch(e){}
   }
@@ -1314,23 +1338,40 @@
   }
 
   async function enableAlerts(){
+    // wait briefly for OneSignal to finish initializing, so we go through its own
+    // permission flow (that's what actually creates a working push subscription)
     try{
-      if('Notification' in window && Notification.permission !== 'granted'){
-        await Notification.requestPermission();
+      await Promise.race([oneSignalReady, new Promise((r) => setTimeout(r, 4000))]);
+    }catch(e){}
+
+    let subscribedViaOneSignal = false;
+    try{
+      if(oneSignalRef && oneSignalRef.Notifications){
+        await oneSignalRef.Notifications.requestPermission();
+        subscribedViaOneSignal = true;
       }
     }catch(e){}
+
+    if(!subscribedViaOneSignal){
+      // OneSignal wasn't available (blocked script, slow network, etc.) — fall back to
+      // plain browser permission so local, in-app reminders can still show a notification
+      try{
+        if('Notification' in window && Notification.permission !== 'granted'){
+          await Notification.requestPermission();
+        }
+      }catch(e){}
+    }
+
     try{
       if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       audioCtx.resume && audioCtx.resume();
     }catch(e){}
-    try{
-      if(window.OneSignal && OneSignal.Notifications && !OneSignal.Notifications.permission){
-        await OneSignal.Notifications.requestPermission();
-      }
-    }catch(e){}
+
     alertsEnabled = true;
     alertsBar.classList.add('enabled');
-    alertsText.textContent = 'Reminders are on';
+    alertsText.textContent = subscribedViaOneSignal
+      ? 'Reminders are on — you\'ll get them even outside the app'
+      : 'Reminders are on (only while the app is open)';
     alertsBtn.textContent = 'On';
   }
 
